@@ -180,6 +180,10 @@ static int g_cuda_enabled;
 static double g_cuda_expert_gb;
 static int g_cuda_dense;
 static int g_cuda_release_host;
+static int g_cuda_zero_copy;     /* every selected device has coherent unified memory
+                                  * (GB10/Grace): tensors are wrapped in place, never
+                                  * duplicated into VRAM, and EVERY loaded expert
+                                  * (pin/LRU/streamed) becomes GPU-servable */
 static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
 static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
 static void qt_cuda_reset(QT *t){
@@ -191,9 +195,26 @@ static int qt_cuda_upload(QT *t){
                         : t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
     return coli_cuda_tensor_upload(&t->cuda,weights,t->s,t->fmt,t->I,t->O,t->cuda_device);
 }
+/* Zero-copy wrap of a freshly loaded expert slot: the GPU reads the slot's slab
+ * in place, so the wrap costs one small struct and no VRAM copy.  This is why
+ * streamed experts run on the GPU here while on discrete GPUs they stay on the
+ * CPU: with coherent unified memory there is no NVMe->VRAM copy to avoid. */
+static void eslot_cuda_wrap(ESlot *s, int eid){
+    if(!g_cuda_enabled||!g_cuda_zero_copy) return;
+    int dev=g_cuda_devices[g_cuda_ndev>1 ? eid%g_cuda_ndev : 0];
+    s->g.cuda_device=s->u.cuda_device=s->d.cuda_device=dev;
+    if(qt_cuda_upload(&s->g)&&qt_cuda_upload(&s->u)&&qt_cuda_upload(&s->d))
+        s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=1;
+    else{
+        qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
+        s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
+    }
+}
 static void cuda_stats_print(void){
     size_t n=0,b=0; coli_cuda_stats(-1,&n,&b);
     fprintf(stderr,"[CUDA] resident set: %zu tensors, %.2f GB VRAM\n",n,b/1e9);
+    size_t zn=0,zb=0; coli_cuda_zc_stats(-1,&zn,&zb);
+    if(zn) fprintf(stderr,"[CUDA] zero-copy set: %zu tensors, %.2f GB host memory read in place\n",zn,zb/1e9);
     if(g_cuda_ndev>1) for(int i=0;i<g_cuda_ndev;i++){
         coli_cuda_stats(g_cuda_devices[i],&n,&b);
         fprintf(stderr,"[CUDA]   device %d: %zu tensors, %.2f GB\n",g_cuda_devices[i],n,b/1e9);
@@ -899,7 +920,9 @@ static QT qt_load(Model *m, const char *name, int O, int I, int bits){
     if(g_cuda_enabled&&g_cuda_dense){
         t.cuda_eligible=1;
         int slot=g_cuda_rr++%g_cuda_ndev; t.cuda_device=g_cuda_devices[slot];
-        g_cuda_dense_projected[slot]+=qt_bytes(&t);
+        /* zero-copy dense tensors occupy no VRAM: reserving their projected
+         * footprint would only shrink the expert-tier budget for nothing */
+        if(!g_cuda_zero_copy) g_cuda_dense_projected[slot]+=qt_bytes(&t);
     }
 #endif
     return t;
@@ -1106,8 +1129,10 @@ static void *map_of_fd(int fd){
 static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
 #ifdef COLI_CUDA
     /* A live REPIN may reuse a GPU-enabled pinned slot for a different expert.
-     * Keep its tier assignment, but invalidate the old device weights. */
-    if(s->eid!=eid){ qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d); }
+     * Keep its tier assignment, but invalidate the old device weights.
+     * Zero-copy wraps capture raw slab pointers, so they are invalidated on
+     * EVERY load: a same-eid reload may land in a reallocated slab. */
+    if(s->eid!=eid||g_cuda_zero_copy){ qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d); }
 #endif
     Cfg *c=&m->c; int I=c->moe_inter, D=c->hidden, b=m->ebits;
     char nm[3][288]; const char *suf[3]={"gate_proj","up_proj","down_proj"};
@@ -1155,6 +1180,9 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
                 char *q=(char*)bq[k]+tq[k]->off; size_t nq=(size_t)tq[k]->nbytes;
                 for(size_t i=0;i<nq;i+=4096) acc+=q[i];
             }
+#ifdef COLI_CUDA
+            eslot_cuda_wrap(s,eid);   /* unified memory: GPU reads the mmap views in place */
+#endif
             s->eid=eid; return 0;
         }
     }
@@ -1253,6 +1281,9 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
     }
+#ifdef COLI_CUDA
+    eslot_cuda_wrap(s,eid);           /* unified memory: GPU reads the slab in place */
+#endif
     s->eid=eid; return 0;
 }
 
@@ -3362,7 +3393,21 @@ static void pin_load(Model *m, const char *statspath, double gb){
         expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1);
     m->resident_bytes+=(int64_t)(gpu_prefix?gpu_prefix:npin)*eb;
 #ifdef COLI_CUDA
-    if(g_cuda_enabled && g_cuda_expert_gb>0){
+    if(g_cuda_enabled && g_cuda_zero_copy){
+        /* Unified memory: every pin was wrapped zero-copy at load time; this
+         * pass only counts the tier (no VRAM to budget, no bytes to move). */
+        for(int a=0;a<npin;a++){
+            ESlot *s=&m->pin[r[a].l][slot_of[a]];
+            if(s->g.cuda_eligible){
+                m->gpu_expert_count++;
+                for(int i=0;i<g_cuda_ndev;i++) if(g_cuda_devices[i]==s->g.cuda_device) placed_n[i]++;
+            }
+        }
+        fprintf(stderr,"[CUDA] hot expert tier: %d/%d experts zero-copy on unified memory (0 extra VRAM)\n",
+            m->gpu_expert_count,npin);
+        if(g_cuda_ndev>1) for(int i=0;i<g_cuda_ndev;i++)
+            fprintf(stderr,"[CUDA]   device %d: %d experts\n",g_cuda_devices[i],placed_n[i]);
+    } else if(g_cuda_enabled && g_cuda_expert_gb>0){
         int gpu_limit=gpu_prefix?gpu_prefix:npin;
         for(int a=0;a<gpu_limit && m->gpu_expert_bytes<budget;a++){
             int li=r[a].l;
@@ -3406,6 +3451,12 @@ static void pin_load(Model *m, const char *statspath, double gb){
             expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1);
         m->resident_bytes+=(int64_t)(npin-gpu_prefix)*eb;
     }
+#ifdef COLI_CUDA
+    if(g_cuda_zero_copy)
+        fprintf(stderr,"[PIN] placement: %d expert in unified RAM (%.1f GB warm, GPU zero-copy) in %.0fs da %s\n",
+            npin,npin*eb/1e9,now_s()-t0,statspath);
+    else
+#endif
     fprintf(stderr,"[PIN] placement: %d VRAM + %d RAM expert (%.1f GB warm) in %.0fs da %s\n",
         m->gpu_expert_count,npin-m->gpu_expert_count,(npin-m->gpu_expert_count)*eb/1e9,now_s()-t0,statspath);
     pin_wire(m);                                   /* inchioda in RAM (no compressione) / wire in RAM (no compression) */
@@ -3614,8 +3665,26 @@ int main(int argc, char **argv){
     if((getenv("COLI_GPU")||getenv("COLI_GPUS"))&&!g_cuda_enabled){ fprintf(stderr,"COLI_GPU(S) requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_dense&&!g_cuda_enabled){ fprintf(stderr,"CUDA_DENSE requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_expert_gb>0 && !g_cuda_enabled){ fprintf(stderr,"CUDA_EXPERT_GB requires COLI_CUDA=1\n"); return 2; }
-    if(g_cuda_enabled) fprintf(stderr,"[CUDA] mode: routed experts%s%s\n",
-        g_cuda_dense?" + resident dense tensors":" only (resident dense on CPU)",
+    /* Coherent unified memory on EVERY selected device (GB10/Grace, detected by
+     * the backend; COLI_CUDA_UNIFIED=0 disables): tensors are wrapped in place
+     * instead of copied to VRAM, and every loaded expert — pinned, LRU-cached or
+     * streamed from disk — is served by the GPU.  The discrete-GPU rules do not
+     * apply: no host backing may ever be released (the GPU reads it), and
+     * CUDA_EXPERT_GB is moot because the tier costs no VRAM. */
+    if(g_cuda_enabled){
+        g_cuda_zero_copy=1;
+        for(int i=0;i<g_cuda_ndev;i++) if(!coli_cuda_unified(g_cuda_devices[i])) g_cuda_zero_copy=0;
+    }
+    if(g_cuda_zero_copy){
+        if(g_cuda_release_host&&getenv("CUDA_RELEASE_HOST"))
+            fprintf(stderr,"[CUDA] unified memory: CUDA_RELEASE_HOST ignored (the GPU reads the host copy in place)\n");
+        g_cuda_release_host=0;
+        if(getenv("CUDA_EXPERT_GB"))
+            fprintf(stderr,"[CUDA] unified memory: CUDA_EXPERT_GB ignored (zero-copy experts use no extra VRAM)\n");
+    }
+    if(g_cuda_enabled) fprintf(stderr,"[CUDA] mode: %s%s%s\n",
+        g_cuda_zero_copy?"ALL experts on GPU (unified-memory zero-copy)":"routed experts",
+        g_cuda_dense?" + resident dense tensors":(g_cuda_zero_copy?"":" only (resident dense on CPU)"),
         g_cuda_release_host?"; VRAM experts without host backing":"");
 #else
     if((getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))) ||

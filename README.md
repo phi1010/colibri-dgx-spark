@@ -270,10 +270,20 @@ path falls back to the CPU per-block on any fault. Numerics are dequant→f32-MA
 
 ### Experimental resident CUDA backend
 
-colibrì includes an opt-in CUDA backend for model-resident tensors. Streaming
-experts deliberately remain on the original CPU path for now: copying an expert
-from NVMe to the GPU on every use would only replace the disk bottleneck with a
-PCIe bottleneck. Resident quantized tensors are uploaded lazily once and reused.
+colibrì includes an opt-in CUDA backend for model-resident tensors. On
+**discrete GPUs** streaming experts deliberately remain on the original CPU
+path: copying an expert from NVMe to the GPU on every use would only replace
+the disk bottleneck with a PCIe bottleneck. Resident quantized tensors are
+uploaded lazily once and reused.
+
+On **coherent unified memory** (NVIDIA GB10 / DGX Spark, Grace — auto-detected,
+`COLI_CUDA_UNIFIED=0` to disable) that rationale doesn't apply and the backend
+switches to zero-copy: tensors are wrapped in place instead of duplicated into
+VRAM, expert-group I/O skips all staging copies, and **every** loaded expert —
+pinned, LRU-cached or streamed — is served by the GPU. `CUDA_EXPERT_GB` and
+`CUDA_RELEASE_HOST` become moot there (no VRAM cost, and the host copy is what
+the GPU reads). All build and runtime variables are documented in
+[docs/gpu-cuda.md](docs/gpu-cuda.md).
 
 ```bash
 cd c

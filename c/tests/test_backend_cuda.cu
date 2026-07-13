@@ -28,8 +28,14 @@ int main(int argc, char **argv) {
     if (!coli_cuda_init(devices, ndev)) return 77;
     if (coli_cuda_device_count() != ndev) return 1;
     int d0 = devices[0], d1 = devices[ndev > 1 ? 1 : 0];
+    /* On unified-memory devices tensors are zero-copy wraps: they count as
+       tensors but occupy no device bytes (kernel results must be identical). */
+    int uni0 = coli_cuda_unified(d0), uni1 = coli_cuda_unified(d1);
+    size_t exp_d0 = uni0 ? 0 : 144, exp_d1 = uni1 ? 0 : 22;
     size_t count = 99, bytes = 99;
     coli_cuda_stats(-1, &count, &bytes);
+    if (count || bytes) return 1;
+    coli_cuda_zc_stats(-1, &count, &bytes);
     if (count || bytes) return 1;
     const float x[8] = {1, -2, 3, -4, 2, 1, -1, 0.5f};
     float got[4];
@@ -121,18 +127,24 @@ int main(int argc, char **argv) {
     if(group_calls!=3||group_experts!=6||group_total_rows!=6) return 1;
 
     coli_cuda_stats(-1, &count, &bytes);
-    if (count != 7 || bytes != 166) {
+    if (count != 7 || bytes != exp_d0 + exp_d1) {
         std::fprintf(stderr, "unexpected CUDA stats: %zu tensors, %zu bytes\n", count, bytes);
+        return 1;
+    }
+    coli_cuda_zc_stats(-1, &count, &bytes);
+    if (count != (uni0 ? 5u : 0u) + (uni1 ? 2u : 0u) ||
+        bytes != (uni0 ? 144u : 0u) + (uni1 ? 22u : 0u)) {
+        std::fprintf(stderr, "unexpected zero-copy stats: %zu tensors, %zu bytes\n", count, bytes);
         return 1;
     }
     if (coli_cuda_tensor_device(t8) != d0 || coli_cuda_tensor_device(tf) != d0 ||
         coli_cuda_tensor_device(t4) != d1 || coli_cuda_tensor_device(t2) != d1) return 1;
     coli_cuda_stats(d0, &count, &bytes);
     if (ndev > 1) {
-        if (count != 5 || bytes != 144) return 1;
+        if (count != 5 || bytes != exp_d0) return 1;
         coli_cuda_stats(d1, &count, &bytes);
-        if (count != 2 || bytes != 22) return 1;
-    } else if (count != 7 || bytes != 166) return 1;
+        if (count != 2 || bytes != exp_d1) return 1;
+    } else if (count != 7 || bytes != exp_d0 + exp_d1) return 1;
 
     coli_cuda_tensor_free(t8);
     coli_cuda_tensor_free(t4);
@@ -143,7 +155,10 @@ int main(int argc, char **argv) {
     coli_cuda_tensor_free(td);
     coli_cuda_stats(-1, &count, &bytes);
     if (count || bytes) return 1;
+    coli_cuda_zc_stats(-1, &count, &bytes);
+    if (count || bytes) return 1;
     coli_cuda_shutdown();
-    std::printf("cuda backend: q8/q4/q2/f32 correctness ok on %d device(s)\n", ndev);
+    std::printf("cuda backend: q8/q4/q2/f32 correctness ok on %d device(s)%s\n", ndev,
+                uni0 ? " [unified memory: zero-copy]" : "");
     return 0;
 }

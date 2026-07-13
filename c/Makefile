@@ -117,6 +117,8 @@ cuda-test: backend_cuda.cu backend_cuda.h tests/test_backend_cuda.cu
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	$(NVCC) $(NVCCFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
 	./backend_cuda_test$(EXE)
+	# on unified-memory hardware (GB10/Grace) also exercise the discrete upload path
+	COLI_CUDA_UNIFIED=0 ./backend_cuda_test$(EXE)
 
 cuda-bench: backend_cuda.cu backend_cuda.h tests/bench_tensor_core.cu
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }

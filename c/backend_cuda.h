@@ -19,8 +19,16 @@ void coli_cuda_shutdown(void);
 int coli_cuda_device_count(void);
 int coli_cuda_device_at(int index);
 int coli_cuda_mem_info(int device, size_t *free_bytes, size_t *total_bytes);
+/* 1 when the device shares coherent memory with the CPU (GB10/Grace, HMM): the
+ * backend then wraps host tensors zero-copy instead of duplicating them into
+ * VRAM, and expert-group I/O skips the staging copies.  The caller must keep
+ * wrapped weights alive and immovable for the tensor's lifetime.
+ * COLI_CUDA_UNIFIED=0 forces the discrete upload path even on such hardware. */
+int coli_cuda_unified(int device);
 /* device < 0 returns aggregate statistics for all configured devices. */
 void coli_cuda_stats(int device, size_t *tensor_count, size_t *tensor_bytes);
+/* Zero-copy wraps: tensors whose bytes stay in host memory (device < 0: all). */
+void coli_cuda_zc_stats(int device, size_t *count, size_t *bytes);
 void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,
                            double *h2d_ms, double *kernel_ms, double *d2h_ms);
 
